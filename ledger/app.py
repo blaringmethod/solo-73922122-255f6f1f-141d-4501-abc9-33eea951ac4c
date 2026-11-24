@@ -6,6 +6,7 @@ import csv
 import datetime as _dt
 import io
 import os
+import re
 from pathlib import Path
 
 from flask import (
@@ -19,10 +20,13 @@ from flask import (
 
 from .store import (
     CSV_FIELDS,
+    DayCoverage,
     Ledger,
     LedgerError,
     LeapSwapRejected,
+    SummaryStale,
     ValidationError,
+    compute_group_stats,
 )
 from .timecode import (
     TimecodeError,
@@ -31,6 +35,35 @@ from .timecode import (
 )
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+STALE_SUMMARY_MESSAGE = (
+    "计算期间有影响该日的导入已提交，本次结果已丢弃；请重新查看（摘要将从最新已提交状态重建）。"
+)
+
+
+def _split_telescopes(raw: str) -> list[str]:
+    """Accept a comma/whitespace separated telescope list."""
+
+    return [part for part in re.split(r"[\s,，、]+", raw or "") if part]
+
+
+def _normalise_group(telescopes: list[str]) -> tuple[str, ...]:
+    return tuple(sorted({name for name in telescopes if name}))
+
+
+def _group_stats_for(day, telescopes: list[str], coverage: DayCoverage):
+    """Return ``(requested_stats, all_telescope_stats or None)``.
+
+    The "all telescopes" histogram comes from the same summary, so comparing a
+    group against the whole night never costs another read.
+    """
+
+    requested = compute_group_stats(coverage, telescopes)
+    if not coverage.telescopes:
+        return requested, None
+    every = list(coverage.telescopes)
+    if _normalise_group(telescopes) == _normalise_group(every):
+        return requested, requested
+    return requested, compute_group_stats(coverage, every)
 
 
 def _csv_report(report) -> str:
@@ -82,13 +115,26 @@ def create_app(config: dict | None = None) -> Flask:
     @app.get("/day")
     def day_view():
         raw_day = request.args.get("date", "").strip()
+        raw_group = request.args.get("group", "").strip()
+        group = _split_telescopes(raw_group)
         day = None
         report = None
+        coverage = None
+        stats_group = None
+        all_group = None
         error = None
+        stale = request.args.get("stale") == "1"
         if raw_day:
             try:
                 day = parse_date(raw_day)
                 report = app.ledger.day_report(day)
+                if group:
+                    coverage = app.ledger.coverage(day)
+                    stats_group, all_group = _group_stats_for(day, group, coverage)
+            except SummaryStale:
+                return redirect(
+                    url_for("day_view", date=raw_day, group=raw_group, stale="1")
+                )
             except (TimecodeError, ValidationError) as exc:
                 error = str(exc)
         else:
@@ -98,10 +144,76 @@ def create_app(config: dict | None = None) -> Flask:
             "day.html",
             active="day",
             raw_day=raw_day,
+            raw_group=raw_group,
             error=error,
             report=report,
+            coverage=coverage,
+            group_stats=stats_group,
+            all_group=all_group,
+            stale=stale,
+            stale_message=STALE_SUMMARY_MESSAGE,
             stats=app.ledger.stats(),
             leap_version=app.ledger.active_table()[0],
+        )
+
+    @app.get("/coverage.csv")
+    def coverage_csv():
+        """Coverage segments for a day plus the histogram for a telescope group."""
+
+        raw_day = request.args.get("date", "").strip()
+        group = _split_telescopes(request.args.get("group", ""))
+        try:
+            day = parse_date(raw_day)
+            if group:
+                coverage, group_stats = app.ledger.group_stats(day, group)
+            else:
+                coverage, group_stats = app.ledger.coverage(day), None
+        except SummaryStale:
+            return redirect(
+                url_for("day_view", date=raw_day, group=",".join(group), stale="1")
+            )
+        except (TimecodeError, ValidationError) as exc:
+            return Response(str(exc), status=400, mimetype="text/plain")
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(
+            [
+                "start_utc",
+                "end_utc_exclusive",
+                "seconds",
+                "telescopes_exposing",
+                "telescope_count",
+            ]
+        )
+        for (start_text, end_text), (start, end, mask) in zip(
+            coverage.segment_times, coverage.segments
+        ):
+            writer.writerow(
+                [
+                    start_text,
+                    end_text,
+                    end - start,
+                    " ".join(coverage.telescopes[i] for i in mask),
+                    len(mask),
+                ]
+            )
+        if group_stats is not None:
+            writer.writerow([])
+            writer.writerow(["simultaneous_telescopes", "seconds", "of_day"])
+            for level in group_stats.levels:
+                writer.writerow(
+                    [
+                        level["simultaneous"],
+                        level["seconds"],
+                        f"{level['ratio']:.6f}",
+                    ]
+                )
+        filename = f"coverage_{coverage.day.isoformat()}.csv"
+        return Response(
+            buffer.getvalue(),
+            mimetype="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
     @app.get("/day.csv")

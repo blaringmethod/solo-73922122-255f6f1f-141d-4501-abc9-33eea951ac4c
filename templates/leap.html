@@ -26,6 +26,7 @@
     <p>提交内容与生效表一致，未做改动（v{{ result.version }}）。</p>
     {% else %}
     <p>已启用闰秒表 v{{ result.version }}（上一版 v{{ result.previous_version }}），重算 {{ result.updated_text_rows }} 条 UTC 文本曝光的实秒，共 {{ result.leap_days }} 个闰秒日。</p>
+    <p class="hint">旧版闰秒表生成的 {{ result.summaries_invalidated }} 份覆盖摘要已失效，下次查看时按新表重建。</p>
     {% endif %}
   </div>
   {% endif %}

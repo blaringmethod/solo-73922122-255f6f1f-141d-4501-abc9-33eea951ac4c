@@ -29,6 +29,7 @@
   <div class="success">
     <h3>导入完成</h3>
     <p>批次 #{{ result.batch_id }}，写入 {{ result.row_count }} 行，使用闰秒表 v{{ result.leap_version }}（{{ result.leap_days }} 个闰秒日）。</p>
+    <p class="hint">使 {{ result.affected_days|length }} 个 UTC 日的覆盖摘要失效：{{ result.affected_days|join("、") if result.affected_days else "无" }}。其他日期继续复用原摘要。</p>
   </div>
   {% endif %}
 </section>

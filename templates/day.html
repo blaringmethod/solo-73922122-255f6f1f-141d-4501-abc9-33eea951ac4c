@@ -6,12 +6,23 @@
   <form class="row" method="get" action="{{ url_for('day_view') }}">
     <label for="date">UTC 日期</label>
     <input type="date" id="date" name="date" value="{{ raw_day }}" min="2000-01-01" max="9999-12-30" required>
+    <label for="group">镜组</label>
+    <input type="text" id="group" name="group" value="{{ raw_group }}" placeholder="如 T1,T2" size="18">
     <button type="submit">查看</button>
     {% if report %}
       <a class="button secondary" href="{{ url_for('day_csv', date=raw_day) }}">下载当天 CSV</a>
     {% endif %}
+    {% if report and group_stats %}
+      <a class="button secondary" href="{{ url_for('coverage_csv', date=raw_day, group=group_stats.telescopes|join(',')) }}">下载联测 CSV</a>
+    {% endif %}
   </form>
-  <p class="hint">区间按左闭右开计算；正闰秒日共 86401 秒，最后一秒为 23:59:60。</p>
+  <p class="hint">区间按左闭右开计算；正闰秒日共 86401 秒，最后一秒为 23:59:60。镜组用逗号分隔，留空则不算联测。</p>
+  {% if stale %}
+  <div class="failure">
+    <p>{{ stale_message }}</p>
+    <p><a class="button secondary" href="{{ url_for('day_view', date=raw_day, group=raw_group) }}">重试</a></p>
+  </div>
+  {% endif %}
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
 </section>
 
@@ -29,6 +40,58 @@
     <div><dt>当天实秒合计</dt><dd>{{ report.total_seconds }} 秒</dd></div>
   </dl>
 </section>
+
+{% if group_stats %}
+<section class="panel">
+  <h2>联测统计：{{ group_stats.telescopes|join("、") }}</h2>
+  <dl class="facts">
+    <div><dt>当天总实秒</dt><dd>{{ group_stats.day_seconds }}</dd></div>
+    <div><dt>至少一台曝光</dt><dd>{{ group_stats.observed_seconds }} 秒</dd></div>
+    <div><dt>全组同时曝光</dt><dd>{{ group_stats.joint_seconds }} 秒</dd></div>
+    <div><dt>覆盖摘要</dt><dd>{{ "复用已有摘要" if coverage.source == "cache" else "已重建" }}（闰秒表 v{{ coverage.leap_version }}，{{ coverage.telescope_count }} 台、{{ coverage.segment_count }} 段，生成于 {{ coverage.built_at }}）</dd></div>
+  </dl>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>同时曝光台数</th><th>实秒数</th><th>占当天</th></tr>
+      </thead>
+      <tbody>
+        {% for level in group_stats.levels %}
+        <tr class="{{ 'empty-row' if not level.available else '' }}">
+          <td>{{ level.simultaneous }} 台</td>
+          <td class="num">{{ level.seconds }}</td>
+          <td class="num">{{ "%.3f%%"|format(level.ratio * 100) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="hint">同一镜号的曝光有重叠时只计一台；0 台档含当天没有任何组内曝光的时间。</p>
+</section>
+
+{% if all_group and all_group.telescopes|length > group_stats.telescopes|length %}
+<section class="panel">
+  <h2>当天覆盖摘要：全部 {{ all_group.telescopes|length }} 台望远镜</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>同时曝光台数</th><th>实秒数</th><th>占当天</th></tr>
+      </thead>
+      <tbody>
+        {% for level in all_group.levels %}
+        <tr class="{{ 'empty-row' if not level.available else '' }}">
+          <td>{{ level.simultaneous }} 台</td>
+          <td class="num">{{ level.seconds }}</td>
+          <td class="num">{{ "%.3f%%"|format(level.ratio * 100) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="hint">摘要与镜组无关，任何镜组都从同一份当天覆盖计算；切换镜组不会重读曝光明细。</p>
+</section>
+{% endif %}
+{% endif %}
 
 <section class="panel">
   <h2>当天相交曝光</h2>

@@ -355,3 +355,265 @@ def test_web_bad_date(client):
     response = client.get("/day?date=1999-12-31")
     assert response.status_code == 200
     assert "2000-01-01" in response.get_data(as_text=True)
+
+
+# ---------------------------------------------------------------------------
+# Simultaneous-exposure statistics and day coverage summaries
+# ---------------------------------------------------------------------------
+
+
+def test_group_stats_counts_simultaneous_seconds(tmp_path):
+    ledger = make_ledger(tmp_path)
+    ledger.import_csv(
+        header()
+        + "T1,A,2016-12-30 00:00:00,600\n"
+        + "T2,B,2016-12-30 00:05:00,600\n"
+        + "T3,C,2016-12-30 00:05:00,600\n"
+    )
+    coverage, stats = ledger.group_stats(NON_LEAP, ["T1", "T2"])
+    assert stats.telescopes == ("T1", "T2")
+    assert coverage.day_seconds == 86400
+    by_level = {level["simultaneous"]: level["seconds"] for level in stats.levels}
+    assert by_level == {0: 86400 - 900, 1: 600, 2: 300}
+    assert sum(by_level.values()) == 86400
+    assert stats.joint_seconds == 300
+
+
+def test_overlapping_exposures_of_one_telescope_count_once(tmp_path):
+    ledger = make_ledger(tmp_path)
+    ledger.import_csv(
+        header()
+        + "T1,A,2016-12-30 00:00:00,600\n"
+        + "T1,A2,2016-12-30 00:03:00,600\n"  # overlaps A on T1
+        + "T2,B,2016-12-30 00:00:00,60\n"
+    )
+    _, stats = ledger.group_stats(NON_LEAP, ["T1"])
+    by_level = {level["simultaneous"]: level["seconds"] for level in stats.levels}
+    # T1 alone: [00:00,00:13) = 780 s, never 2 even inside the self-overlap.
+    assert by_level[1] == 780
+    assert by_level[0] == 86400 - 780
+
+
+def test_group_stats_honours_half_open_and_leap_last_second(tmp_path):
+    ledger = make_ledger(tmp_path)
+    ledger.import_csv(
+        header()
+        + "T1,LAST,2016-12-31 23:59:60,1\n"
+        + "T2,AT_END,2017-01-01 00:00:00,10\n"
+        + "T1,BEFORE,2016-12-31 23:59:59,1\n"
+    )
+    coverage, stats = ledger.group_stats(LEAP, ["T1", "T2"])
+    assert coverage.day_seconds == 86401
+    assert coverage.day_last_utc == "2016-12-31 23:59:60"
+    by_level = {level["simultaneous"]: level["seconds"] for level in stats.levels}
+    # BEFORE covers 23:59:59, LAST covers 23:59:60; AT_END is outside the day.
+    assert by_level[1] == 2
+    assert by_level[0] == 86401 - 2
+    # The two adjacent real seconds merge into one contiguous T1 segment.
+    assert coverage.segments == ((86399, 86401, (0,)),)
+
+
+def test_coverage_is_reused_across_groups_without_reading_details(tmp_path, monkeypatch):
+    ledger = make_ledger(tmp_path)
+    ledger.import_csv(
+        header()
+        + "T1,A,2016-12-30 00:00:00,600\n"
+        + "T2,B,2016-12-30 00:05:00,600\n"
+    )
+    first, _ = ledger.group_stats(NON_LEAP, ["T1"])
+    assert first.source == "rebuilt"
+    second, _ = ledger.group_stats(NON_LEAP, ["T1", "T2"])
+
+    def boom(_day):
+        raise AssertionError("exposure details must not be read for a cached summary")
+
+    monkeypatch.setattr(ledger, "day_report", boom)
+    third, stats = ledger.group_stats(NON_LEAP, ["T2"])
+    assert second.source == "cache"
+    assert third.source == "cache"
+    assert stats.telescopes == ("T2",)
+
+
+def test_import_invalidates_only_days_it_covers(tmp_path):
+    ledger = make_ledger(tmp_path)
+    ledger.import_csv(header() + "T1,A,2016-12-29 12:00:00,600\n")
+    ledger.coverage(dt.date(2016, 12, 28))
+    ledger.coverage(dt.date(2016, 12, 29))
+    ledger.coverage(dt.date(2016, 12, 30))
+
+    result = ledger.import_csv(header() + "T1,B,2016-12-29 20:00:00,600\n")
+    assert result["affected_days"] == ["2016-12-29"]
+    assert ledger.coverage(dt.date(2016, 12, 28)).source == "cache"
+    assert ledger.coverage(dt.date(2016, 12, 30)).source == "cache"
+    assert ledger.coverage(dt.date(2016, 12, 29)).source == "rebuilt"
+
+
+def test_cross_midnight_import_invalidates_both_days(tmp_path):
+    ledger = make_ledger(tmp_path)
+    ledger.coverage(dt.date(2016, 12, 29))
+    ledger.coverage(dt.date(2016, 12, 30))
+    result = ledger.import_csv(header() + "T1,X,2016-12-29 23:59:00,120\n")
+    assert result["affected_days"] == ["2016-12-29", "2016-12-30"]
+
+
+def test_failed_import_keeps_summaries(tmp_path):
+    ledger = make_ledger(tmp_path)
+    ledger.import_csv(header() + "T1,A,2016-12-30 00:00:00,600\n")
+    before, _ = ledger.group_stats(NON_LEAP, ["T1"])
+    with pytest.raises(ValidationError):
+        ledger.import_csv(header() + "T1,B,2016-12-30 00:00:00,0\n")
+    after, _ = ledger.group_stats(NON_LEAP, ["T1"])
+    assert before.source == "rebuilt"
+    assert after.source == "cache"
+    assert after.built_at == before.built_at
+
+
+def test_leap_swap_invalidates_all_summaries(tmp_path):
+    ledger = make_ledger(tmp_path)
+    ledger.import_csv(header() + "T1,A,2016-12-30 00:00:00,600\n")
+    ledger.coverage(NON_LEAP)
+    ledger.coverage(LEAP)
+    result = ledger.replace_leap_table("2015-06-30\n2016-12-31\n")
+    assert result["summaries_invalidated"] == 2
+    assert ledger.coverage(NON_LEAP).source == "rebuilt"
+    assert ledger.coverage(LEAP).source == "rebuilt"
+
+
+def test_failed_leap_swap_keeps_summaries(tmp_path):
+    ledger = make_ledger(tmp_path)
+    ledger.import_csv(header() + "T1,KEEP,2016-12-31 23:59:60,1\n")
+    before, _ = ledger.group_stats(LEAP, ["T1"])
+    with pytest.raises(LeapSwapRejected):
+        ledger.replace_leap_table("2015-06-30\n")
+    after, _ = ledger.group_stats(LEAP, ["T1"])
+    assert after.source == "cache"
+    assert after.built_at == before.built_at
+
+
+def test_import_committed_during_rebuild_discards_stale_result(tmp_path):
+    from ledger import store as store_module
+
+    ledger = make_ledger(tmp_path)
+    ledger.import_csv(header() + "T1,A,2016-12-30 00:00:00,600\n")
+    real_build = store_module._build_coverage
+    inserted = {"done": False}
+
+    def build_then_import(*args, **kwargs):
+        result = real_build(*args, **kwargs)
+        if not inserted["done"]:
+            inserted["done"] = True
+            # A committed change touching this day lands before the summary
+            # write: the numbers computed above are now out of date.
+            ledger.import_csv(header() + "T2,B,2016-12-30 01:00:00,600\n")
+        return result
+
+    store_module._build_coverage = build_then_import
+    try:
+        from ledger.store import SummaryStale
+
+        with pytest.raises(SummaryStale):
+            ledger.coverage(NON_LEAP)
+    finally:
+        store_module._build_coverage = real_build
+
+    retried, _ = ledger.group_stats(NON_LEAP, ["T1", "T2"])
+    assert retried.source == "rebuilt"
+    assert retried.built_at != ""
+
+
+def test_import_can_commit_while_a_rebuild_is_in_progress(tmp_path):
+    from ledger import store as store_module
+
+    ledger = make_ledger(tmp_path)
+    ledger.import_csv(header() + "T1,A,2016-12-30 00:00:00,600\n")
+    real_build = store_module._build_coverage
+    finished = {"value": False}
+
+    def slow_build(*args, **kwargs):
+        # Simulate a long rebuild: another writer commits while it computes.
+        ledger.import_csv(header() + "T2,B,2016-12-30 02:00:00,600\n")
+        finished["value"] = True
+        return real_build(*args, **kwargs)
+
+    store_module._build_coverage = slow_build
+    try:
+        try:
+            ledger.coverage(NON_LEAP)
+        except store_module.SummaryStale:
+            # Detecting the mid-build commit is the other valid outcome.
+            pass
+    finally:
+        store_module._build_coverage = real_build
+    assert finished["value"] is True
+    # Either the rebuild noticed the change and was discarded, or it ran after
+    # the import; retrying always yields the committed state.
+    fresh = ledger.coverage(NON_LEAP)
+    assert fresh.source == "rebuilt"
+    assert "T2" in fresh.telescopes
+
+
+def test_web_group_stats_and_coverage_csv(client):
+    client.post(
+        "/import",
+        data={
+            "csv_text": header()
+            + "T1,A,2016-12-31 00:00:00,600\n"
+            + "T2,B,2016-12-31 00:05:00,600\n"
+            + "T3,C,2016-12-31 00:05:00,600\n"
+        },
+    )
+    page = client.get("/day?date=2016-12-31&group=T1,T2")
+    text = page.get_data(as_text=True)
+    assert page.status_code == 200
+    assert "联测统计" in text
+    assert "300" in text
+    download = client.get("/coverage.csv?date=2016-12-31&group=T1,T2")
+    assert download.status_code == 200
+    body = download.get_data(as_text=True)
+    assert "T1 T2" in body
+    assert "simultaneous_telescopes" in body
+
+
+def test_web_stale_rebuild_redirects_with_retry_prompt(client, monkeypatch):
+    from ledger import store as store_module
+
+    client.post(
+        "/import",
+        data={"csv_text": header() + "T1,A,2016-12-30 00:00:00,60\n"},
+    )
+    ledger = client.application.ledger
+    real_build = store_module._build_coverage
+    state = {"fired": False}
+
+    def build_then_change(*args, **kwargs):
+        result = real_build(*args, **kwargs)
+        if not state["fired"]:
+            state["fired"] = True
+            ledger.import_csv(header() + "T2,B,2016-12-30 01:00:00,60\n")
+        return result
+
+    monkeypatch.setattr(store_module, "_build_coverage", build_then_change)
+    response = client.get("/day?date=2016-12-30&group=T1,T2")
+    assert response.status_code == 302
+    assert "stale=1" in response.headers["Location"]
+    page = client.get(response.headers["Location"])
+    text = page.get_data(as_text=True)
+    assert "本次结果已丢弃" in text
+    assert "重试" in text
+    # The retry path rebuilt from the committed state and shows both telescopes.
+    retried = client.get("/day?date=2016-12-30&group=T1,T2").get_data(as_text=True)
+    assert "已重建" in retried or "复用已有摘要" in retried
+    assert "联测统计" in retried
+
+
+def test_web_import_reports_affected_days(client):
+    response = client.post(
+        "/import",
+        data={
+            "csv_text": header()
+            + "T1,X,2016-12-29 23:59:00,120\n"
+        },
+    )
+    text = response.get_data(as_text=True)
+    assert "2016-12-29" in text and "2016-12-30" in text
+    assert "覆盖摘要失效" in text
